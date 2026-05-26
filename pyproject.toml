@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lora-reward-density"
+version = "0.0.1"
+description = "Empirical study of LoRA rank requirements vs RL reward density (CS224R Spring 2026)"
+requires-python = ">=3.11,<3.13"
+authors = [{ name = "Mark Gernitis" }]
+dependencies = [
+    "datasets>=2.20",
+    "numpy>=1.26",
+    "pydantic>=2.7",
+    "rich>=13.7",
+    "tyro>=0.9",
+    "wandb>=0.18",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "torch>=2.4",
+    "transformers>=4.50",
+    "peft>=0.13",
+    "accelerate>=1.0",
+    "trl>=0.11",
+    "vllm>=0.6",
+]
+eval = [
+    "math-verify>=0.5",
+]
+modal = [
+    "modal>=0.66",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.7",
+    "pyright>=1.1.380",
+    # CPU stack so reward/rollout tests run locally without [gpu]
+    "torch>=2.4",
+    "transformers>=4.50",
+    "math-verify>=0.5",
+    # Analysis + plots
+    "matplotlib>=3.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lora_reward_density"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "PIE", "RET", "PT", "PTH"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B", "N", "PT011"]
+
+[tool.pyright]
+# modal_app/ is excluded — Modal entrypoint scripts use Modal/transformers
+# APIs whose runtime types confuse pyright. Lint via ruff is sufficient.
+include = ["src", "tests"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+reportMissingImports = "warning"
+reportMissingTypeStubs = "none"
+# Silence torch's re-export style (torch.ones, torch.zeros, etc.) — known
+# pyright/torch friction, not a real bug.
+reportPrivateImportUsage = "none"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
