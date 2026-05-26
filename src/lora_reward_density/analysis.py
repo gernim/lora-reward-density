@@ -11,8 +11,10 @@ inside ``plot_*`` functions so this module loads without it.
 
 from __future__ import annotations
 
+import gzip
 import json
 import statistics
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -89,6 +91,34 @@ class BaselineResults:
             start = i * self.n_samples
             out.append(list(values[start : start + self.n_samples]))
         return out
+
+
+def iter_completions(run_dir: Path | str) -> Iterator[dict[str, Any]]:
+    """Stream per-completion records from a run's ``completions.jsonl.gz``.
+
+    Each record is a dict with keys ``i`` (completion index in ``[0, N)``),
+    ``prompt_idx`` (which prompt produced it), ``completion`` (raw text),
+    ``length_tokens``, and ``correct``.
+
+    Use to investigate degenerate outputs, filter by correctness, or build
+    qualitative-error analyses for the final report. ``baseline_eval.json``
+    only inlines the first 50 completions for quick inspection; the full
+    N (typically 4000) live in this gzipped sibling file.
+
+    Raises ``FileNotFoundError`` if the run dir predates F3 (the file isn't
+    present for runs before 2026-05-25).
+    """
+    gz_path = Path(run_dir) / "completions.jsonl.gz"
+    if not gz_path.is_file():
+        raise FileNotFoundError(
+            f"No completions.jsonl.gz at {gz_path}. "
+            "Runs before 2026-05-25 only stored the first 50 completions inline."
+        )
+    with gzip.open(gz_path, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
 
 
 # ----------------------------------------------------------------------------

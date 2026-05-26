@@ -102,3 +102,32 @@ def test_outcome_reward_handles_unparseable_completion():
 
     assert output.trajectory_rewards.tolist() == [0.0]
     assert output.metadata["correctness"].tolist() == [False]
+
+
+def test_outcome_reward_empty_parse_counts_as_parse_failure():
+    """F1: silent-timeout / unparseable parse() result must increment parse_failures.
+
+    math-verify's `parsing_timeout` argument returns an empty list instead of
+    raising on timeout. Prior to F1, the exception-based counter undercounted
+    real failures; now any empty parse counts.
+    """
+    # "totally not math" has no math expression for math-verify to extract,
+    # so parse() returns []. Pre-F1 this scored as incorrect with
+    # parse_failures=0; post-F1 it must be parse_failures=1.
+    canned = {"q": ["totally not math at all"]}
+    golds = {"q": "42"}
+    output = OutcomeRewardModule().score(_rollout(canned, golds))
+
+    assert output.metadata["correctness"].tolist() == [False]
+    assert output.metadata["parse_failures"] == 1
+
+
+def test_outcome_reward_parse_failures_zero_on_clean_batch():
+    """parse_failures must be 0 when every completion parses cleanly."""
+    canned = {
+        "q1": ["\\boxed{1}", "\\boxed{2}"],
+        "q2": ["\\boxed{3}", "\\boxed{4}"],
+    }
+    golds = {"q1": "1", "q2": "3"}
+    output = OutcomeRewardModule().score(_rollout(canned, golds))
+    assert output.metadata["parse_failures"] == 0

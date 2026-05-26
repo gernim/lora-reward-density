@@ -145,8 +145,32 @@ def run_baseline_eval(
     print(f"  Scored in {score_seconds:.1f}s")
 
     response_lengths = batch.completion_mask.sum(dim=1).tolist()
-    # First 50 completions for qualitative inspection in the report.
+    # First 50 completions for inline qualitative inspection without
+    # decompressing the full completions.jsonl.gz (written below).
     sample_completions = batch.completions[: min(50, batch.num_completions)]
+
+    # Persist all completions in a sibling jsonl.gz file. ~1.5 MB (student)
+    # to ~6 MB (teacher) compressed per run; ~60–100 MB across the 24-run
+    # matrix. Needed for forensic debugging of degenerate outputs, reward
+    # curves, and per-completion analysis in Phase 2 training runs.
+    import gzip
+    import json as _json
+
+    correctness_list = reward_output.metadata["correctness"].tolist()
+    completions_jsonl = "\n".join(
+        _json.dumps(
+            {
+                "i": i,
+                "prompt_idx": int(batch.group_index[i].item()),
+                "completion": batch.completions[i],
+                "length_tokens": int(response_lengths[i]),
+                "correct": bool(correctness_list[i]),
+            },
+            ensure_ascii=False,
+        )
+        for i in range(batch.num_completions)
+    )
+    completions_gz = gzip.compress(completions_jsonl.encode("utf-8"))
 
     return {
         "model_id": model_id,
@@ -154,12 +178,13 @@ def run_baseline_eval(
         "num_prompts": len(examples),
         "n_samples": n_samples,
         "rewards": reward_output.trajectory_rewards.tolist(),
-        "correctness": reward_output.metadata["correctness"].tolist(),
+        "correctness": correctness_list,
         "response_lengths": response_lengths,
         "group_index": batch.group_index.tolist(),
         "parse_failures": int(reward_output.metadata["parse_failures"]),
         "prompt_metadata": metadata,
         "sample_completions": sample_completions,
+        "completions_gz": completions_gz,
         "sampling": {
             "temperature": temperature,
             "top_p": top_p,
@@ -237,8 +262,18 @@ def main(
         max_model_len=max_model_len,
     )
 
+    # Strip the gzipped completions blob from the JSON-bound payload and
+    # write it to a sibling file. Keeps baseline_eval.json small and
+    # uncluttered for analysis tools that only want metadata.
+    completions_gz = result.pop("completions_gz", None)
+
     output_path.write_text(json.dumps(result, indent=2, sort_keys=True))
     print(f"\nWrote {output_path}")
+
+    if completions_gz is not None:
+        completions_path = output_path.parent / "completions.jsonl.gz"
+        completions_path.write_bytes(completions_gz)
+        print(f"Wrote {completions_path} ({len(completions_gz) / 1e6:.1f} MB)")
 
     correctness = result["correctness"]
     print(f"  num_completions = {len(correctness)}")

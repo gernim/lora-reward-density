@@ -244,3 +244,31 @@ def test_plot_factories_smoke(tmp_path: Path):
 
     for name in ("pass_at_k.png", "lengths.png", "by_subject.png", "by_level.png"):
         assert (tmp_path / name).is_file()
+
+
+def test_iter_completions_reads_jsonl_gz(tmp_path: Path):
+    """F3: iter_completions streams records from completions.jsonl.gz."""
+    import gzip
+    import json
+
+    from lora_reward_density.analysis import iter_completions
+
+    records = [
+        {"i": 0, "prompt_idx": 0, "completion": "a", "length_tokens": 1, "correct": True},
+        {"i": 1, "prompt_idx": 0, "completion": "b", "length_tokens": 1, "correct": False},
+        {"i": 2, "prompt_idx": 1, "completion": "c", "length_tokens": 1, "correct": True},
+    ]
+    gz_path = tmp_path / "completions.jsonl.gz"
+    with gzip.open(gz_path, "wt", encoding="utf-8") as f:
+        f.write("\n".join(json.dumps(r) for r in records))
+
+    loaded = list(iter_completions(tmp_path))
+    assert loaded == records
+
+
+def test_iter_completions_missing_file_raises(tmp_path: Path):
+    """F3: missing completions.jsonl.gz raises FileNotFoundError with helpful hint."""
+    from lora_reward_density.analysis import iter_completions
+
+    with pytest.raises(FileNotFoundError, match="completions.jsonl.gz"):
+        list(iter_completions(tmp_path))

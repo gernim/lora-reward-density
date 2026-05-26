@@ -7,6 +7,8 @@ correct/incorrect reward, broadcast across the trajectory's valid tokens.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
 from dataclasses import dataclass
 
@@ -47,6 +49,16 @@ class OutcomeRewardModule:
         correctness = torch.zeros(n, dtype=torch.bool)
         parse_failures = 0
 
+        def _parse_quiet(text: str) -> list:
+            # math-verify's `parsing_timeout` returns an empty list silently
+            # on timeout (rather than raising) and prints
+            # "Timeout during parsing: <full text>" to stderr. That stderr
+            # spew is huge on degenerate completions and dominates Modal
+            # logs in long batches; redirecting it keeps logs readable.
+            # Callers detect the timeout via the empty-result check below.
+            with contextlib.redirect_stderr(io.StringIO()):
+                return parse(text, parsing_timeout=cfg.parse_timeout_seconds)
+
         for i, completion in enumerate(batch.completions):
             prompt_idx = int(batch.group_index[i].item())
             md = batch.prompt_metadata[prompt_idx]
@@ -55,9 +67,18 @@ class OutcomeRewardModule:
             gold_text = md[GOLD_ANSWER_KEY]
 
             try:
-                gold = parse(gold_text, parsing_timeout=cfg.parse_timeout_seconds)
-                ans = parse(completion, parsing_timeout=cfg.parse_timeout_seconds)
-                ok = bool(verify(gold, ans, timeout_seconds=cfg.verify_timeout_seconds))
+                gold = _parse_quiet(gold_text)
+                ans = _parse_quiet(completion)
+                if not ans:
+                    # Empty parse result = silent timeout or unparseable
+                    # output. The trajectory was never going to verify as
+                    # correct, but we must explicitly count it — otherwise
+                    # `parse_failures` only captures exception-raising
+                    # failures and silently undercounts the rest.
+                    parse_failures += 1
+                    ok = False
+                else:
+                    ok = bool(verify(gold, ans, timeout_seconds=cfg.verify_timeout_seconds))
             except Exception as e:  # noqa: BLE001 — math-verify can raise sympy/timeout errors
                 logger.warning("math-verify failed on completion %d: %s", i, e)
                 ok = False
