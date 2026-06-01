@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+.ruff_cache/
+.pyright/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Experiment outputs
+runs/
+checkpoints/
+wandb/
+.modal/
+figs/
+
+# Model + data cache
+.cache/
+*.safetensors
+*.bin
+*.gguf
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Environment
+.env
+.env.local
+.envrc
+
+# Claude Code / AI agents
+CLAUDE.md
+.claude/
+AGENTS.md
