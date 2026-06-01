@@ -87,7 +87,10 @@ class OutcomeRewardModule:
             correctness[i] = ok
             traj[i] = cfg.correct_reward if ok else cfg.incorrect_reward
 
-        token_rewards = traj.unsqueeze(1) * batch.completion_mask.float()
+        # Reward modules emit CPU tensors (design.md §683); completion_mask may
+        # live on the rollout device (GPU in the Modal generate path), so pull
+        # it to CPU before the product to avoid a cross-device multiply.
+        token_rewards = traj.unsqueeze(1) * batch.completion_mask.float().cpu()
         return RewardOutput(
             token_rewards=token_rewards,
             trajectory_rewards=traj,
