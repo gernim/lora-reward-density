@@ -36,12 +36,23 @@ class RolloutBatch:
     All tensor fields align along dim 0 = P*G. `group_index[i]` identifies which
     prompt produced row i — used by GRPO's group-mean baseline.
 
-    Padding: token tensors are right-padded to T_max, with `completion_mask`
-    True at valid positions. EOS counts as valid; positions beyond it are pad.
+    Padding conventions differ by segment so a per-row [prompt | completion]
+    concatenation is contiguous (no pad wedged between the two):
+    - `completion_token_ids` are **right**-padded to T_max; `completion_mask`
+      is True at valid positions. EOS counts as valid; positions beyond it
+      are pad.
+    - `prompt_token_ids` are **left**-padded to prompt_len; `prompt_attention_mask`
+      is True at real prompt tokens. Left-padding keeps each prompt's real
+      tokens flush against its completion, so the policy forward pass (which
+      cat's [prompt | completion]) aligns the prompt's last token with the
+      first completion token. The prompt fields are replicated G times so they
+      align row-for-row with completions (dim 0 = P*G, not P).
     """
 
     prompts: list[str]
     prompt_metadata: list[dict[str, Any]]
+    prompt_token_ids: torch.Tensor  # [P*G, prompt_len] long, left-padded
+    prompt_attention_mask: torch.Tensor  # [P*G, prompt_len] bool, True at real prompt tokens
     completions: list[str]
     completion_token_ids: torch.Tensor  # [P*G, T_max] long
     completion_mask: torch.Tensor  # [P*G, T_max] bool
@@ -91,6 +102,16 @@ class RolloutBatch:
             )
         if self.group_index.shape != (n,):
             raise ValueError(f"group_index shape {tuple(self.group_index.shape)} != ({n},)")
+        if self.prompt_token_ids.shape[0] != n:
+            raise ValueError(
+                f"prompt_token_ids.shape[0] ({self.prompt_token_ids.shape[0]}) "
+                f"!= num_completions ({n}); prompt tensors must be replicated to P*G"
+            )
+        if self.prompt_token_ids.shape != self.prompt_attention_mask.shape:
+            raise ValueError(
+                f"prompt_token_ids {tuple(self.prompt_token_ids.shape)} "
+                f"!= prompt_attention_mask {tuple(self.prompt_attention_mask.shape)}"
+            )
 
 
 class RolloutEngine(Protocol):
@@ -114,15 +135,26 @@ def _pack_rollout(
     prompts: list[str],
     prompt_metadata: list[dict[str, Any]],
     completions: list[str],
+    prompt_token_id_lists: list[list[int]],
     token_id_lists: list[list[int]],
     logprob_lists: list[list[float]],
     group_index: list[int],
     pad_token_id: int,
 ) -> RolloutBatch:
-    """Right-pad ragged completion sequences into rectangular tensors."""
+    """Pack ragged sequences into rectangular tensors.
+
+    Completions are right-padded to T_max; prompts are left-padded to
+    prompt_len (see RolloutBatch for why the padding sides differ).
+    `prompt_token_id_lists` is per-completion (length P*G), already replicated
+    G times to align row-for-row with completions.
+    """
     n = len(completions)
     if any(len(t) != len(lp) for t, lp in zip(token_id_lists, logprob_lists, strict=True)):
         raise ValueError("token_ids and logprobs must have equal length per completion")
+    if len(prompt_token_id_lists) != n:
+        raise ValueError(
+            f"prompt_token_id_lists ({len(prompt_token_id_lists)}) != num_completions ({n})"
+        )
 
     t_max = max((len(t) for t in token_id_lists), default=0)
     if t_max == 0:
@@ -139,9 +171,24 @@ def _pack_rollout(
         mask[i, :length] = True
         logprobs[i, :length] = torch.tensor(lps, dtype=torch.float32)
 
+    # Prompts: left-pad so real tokens sit flush against the completion.
+    p_max = max((len(p) for p in prompt_token_id_lists), default=0)
+    if p_max == 0:
+        raise ValueError("all prompts are empty; cannot build a rollout batch")
+    prompt_ids = torch.full((n, p_max), pad_token_id, dtype=torch.long)
+    prompt_mask = torch.zeros((n, p_max), dtype=torch.bool)
+    for i, ptoks in enumerate(prompt_token_id_lists):
+        length = len(ptoks)
+        if length == 0:
+            continue
+        prompt_ids[i, p_max - length :] = torch.tensor(ptoks, dtype=torch.long)
+        prompt_mask[i, p_max - length :] = True
+
     return RolloutBatch(
         prompts=prompts,
         prompt_metadata=prompt_metadata,
+        prompt_token_ids=prompt_ids,
+        prompt_attention_mask=prompt_mask,
         completions=completions,
         completion_token_ids=token_ids,
         completion_mask=mask,
@@ -198,11 +245,13 @@ class VLLMRolloutEngine:
         outputs = self._llm.generate(prompts, params)
 
         completions: list[str] = []
+        prompt_token_id_lists: list[list[int]] = []
         token_id_lists: list[list[int]] = []
         logprob_lists: list[list[float]] = []
         group_index: list[int] = []
 
         for prompt_idx, output in enumerate(outputs):
+            prompt_toks = list(output.prompt_token_ids or [])
             for completion in output.outputs:
                 if completion.logprobs is None:
                     raise RuntimeError(
@@ -218,6 +267,7 @@ class VLLMRolloutEngine:
                         )
                     lps.append(step[tok_id].logprob)
                 completions.append(completion.text)
+                prompt_token_id_lists.append(prompt_toks)  # same prompt for all G samples
                 token_id_lists.append(tok_ids)
                 logprob_lists.append(lps)
                 group_index.append(prompt_idx)
@@ -226,6 +276,7 @@ class VLLMRolloutEngine:
             prompts=prompts,
             prompt_metadata=prompt_metadata,
             completions=completions,
+            prompt_token_id_lists=prompt_token_id_lists,
             token_id_lists=token_id_lists,
             logprob_lists=logprob_lists,
             group_index=group_index,
@@ -249,12 +300,18 @@ class DeterministicMockRolloutEngine:
     def __init__(self, canned: dict[str, list[str]]) -> None:
         self._canned: dict[str, list[str]] = dict(canned)
         self._vocab: dict[str, int] = {}
+        # Completions first (keeps their token IDs stable), then prompt text —
+        # prompts must also be tokenizable now that we emit prompt_token_ids.
         for samples in self._canned.values():
             for sample in samples:
                 for word in sample.split():
                     if word not in self._vocab:
                         # Reserve 0 for pad; assign 1, 2, 3, ...
                         self._vocab[word] = len(self._vocab) + 1
+        for prompt in self._canned:
+            for word in prompt.split():
+                if word not in self._vocab:
+                    self._vocab[word] = len(self._vocab) + 1
 
     def _tokenize(self, text: str) -> list[int]:
         return [self._vocab[word] for word in text.split()]
@@ -271,6 +328,7 @@ class DeterministicMockRolloutEngine:
             )
 
         completions: list[str] = []
+        prompt_token_id_lists: list[list[int]] = []
         token_id_lists: list[list[int]] = []
         logprob_lists: list[list[float]] = []
         group_index: list[int] = []
@@ -284,9 +342,11 @@ class DeterministicMockRolloutEngine:
                     f"mock has {len(samples)} canned samples for prompt {prompt!r} "
                     f"but config.n={config.n}"
                 )
+            prompt_toks = self._tokenize(prompt)
             for sample in samples[: config.n]:
                 tok_ids = self._tokenize(sample)
                 completions.append(sample)
+                prompt_token_id_lists.append(prompt_toks)
                 token_id_lists.append(tok_ids)
                 logprob_lists.append([-2.0] * len(tok_ids))
                 group_index.append(prompt_idx)
@@ -295,6 +355,7 @@ class DeterministicMockRolloutEngine:
             prompts=prompts,
             prompt_metadata=prompt_metadata,
             completions=completions,
+            prompt_token_id_lists=prompt_token_id_lists,
             token_id_lists=token_id_lists,
             logprob_lists=logprob_lists,
             group_index=group_index,
