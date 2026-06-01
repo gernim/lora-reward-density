@@ -54,3 +54,13 @@ def test_default_run_id_is_utc_timestamp(tmp_path: Path):
     assert len(rd.run_id) == 16
     assert rd.run_id.endswith("Z")
     assert "T" in rd.run_id
+
+
+def test_suffix_disambiguates_same_second_runs(tmp_path: Path):
+    """Matrix fan-out creates many run dirs in the same second; the cell-label
+    suffix keeps them unique (and self-describing)."""
+    a = create_run_dir(tmp_path, suffix="outcome_rank1_seed0")
+    b = create_run_dir(tmp_path, suffix="outcome_rank4_seed0")
+    assert a.run_id != b.run_id
+    assert a.run_id.endswith("_outcome_rank1_seed0")
+    assert b.run_id.endswith("_outcome_rank4_seed0")

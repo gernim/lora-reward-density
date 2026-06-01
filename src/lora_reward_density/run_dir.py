@@ -66,6 +66,7 @@ def create_run_dir(
     base: Path | str,
     *,
     run_id: str | None = None,
+    suffix: str | None = None,
     config: dict[str, Any] | None = None,
 ) -> RunDir:
     """Create ``<base>/<run_id>/`` and snapshot environment, git, and config.
@@ -83,6 +84,10 @@ def create_run_dir(
     base = Path(base)
     if run_id is None:
         run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        if suffix:
+            # Disambiguate runs created in the same second (e.g. matrix fan-out)
+            # and make the dir self-describing: <timestamp>_<cell-label>.
+            run_id = f"{run_id}_{suffix}"
     path = base / run_id
     if path.exists():
         raise FileExistsError(f"run dir already exists: {path}")
