@@ -27,6 +27,7 @@ from lora_reward_density.rollout import DeterministicMockRolloutEngine, Sampling
 from lora_reward_density.train import (
     TrainRunConfig,
     compute_completion_logprobs,
+    microbatched_logprobs,
     training_step,
 )
 
@@ -105,8 +106,15 @@ def test_training_step_runs_and_updates_student():
 
     diag = training_step(**kwargs)
 
-    # Diagnostics flow through from the loss; loss is finite.
-    assert {"loss", "mean_reward"} <= set(diag)
+    # Diagnostics flow through: loss-side keys + the training_step-added ones.
+    assert {
+        "loss",
+        "mean_reward",
+        "grad_norm",
+        "skipped_nonfinite",
+        "response_len_mean",
+        "frac_truncated",
+    } <= set(diag)
     assert math.isfinite(diag["loss"])
     # End-to-end gradient signal reached the student's parameters.
     assert not torch.allclose(before_student, student.embed.weight)
@@ -147,6 +155,28 @@ class _PosLM(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1]).expand_as(input_ids)
         return SimpleNamespace(logits=self.tok(input_ids) + self.pos(position_ids))
+
+
+def test_microbatched_logprobs_matches_single_batch():
+    """Chunking the no-grad logprob forward is numerically identical to one pass."""
+    torch.manual_seed(0)
+    model = _TinyLM(_VOCAB)
+    model.eval()
+    engine = DeterministicMockRolloutEngine(_CANNED)
+    batch = engine.rollout(
+        list(_CANNED), [{} for _ in _CANNED], SamplingConfig(n=4, max_tokens=8)
+    )  # N = 2 prompts × 4 = 8 trajectories
+    args = (
+        batch.prompt_token_ids,
+        batch.completion_token_ids,
+        batch.completion_mask,
+        batch.prompt_attention_mask,
+    )
+    full = compute_completion_logprobs(model, *args)
+    for mb in (2, 3, 8, None):  # incl. an uneven chunk (3) and mb >= N (8)
+        chunked = microbatched_logprobs(model, *args, micro_batch_size=mb)
+        assert chunked.shape == full.shape
+        assert torch.allclose(full, chunked, atol=1e-6), f"mismatch at micro_batch_size={mb}"
 
 
 def test_compute_completion_logprobs_is_left_pad_invariant():

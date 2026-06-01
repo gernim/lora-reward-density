@@ -56,6 +56,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _fmt_duration(seconds: float) -> str:
+    """Compact h/m/s for progress lines, e.g. 754 -> '12m34s', 4830 -> '1h20m'."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
@@ -100,6 +110,13 @@ class TrainRunConfig:
     # variance for GRPO (see experiments.md D7). Recorded here so config.json
     # captures which slice of the train pool a run actually saw.
     train_levels: tuple[int, ...] | None = None
+
+    # Memory: chunk the per-token logprob forwards into micro-batches of this
+    # many trajectories (None = single forward). Bounds peak logits memory to
+    # micro_batch × T × V; needed at experiment scale where N × T × V OOMs.
+    # The no-grad forwards (reference, sampler) use this directly; the learner
+    # forward pairs it with gradient accumulation (see docs/microbatching.md).
+    logprob_micro_batch_size: int | None = None
 
     # Optimization
     num_rollouts: int = 200
@@ -301,6 +318,53 @@ def compute_completion_logprobs(
     return gather_token_logprobs(completion_logits, completion_ids)
 
 
+def microbatched_logprobs(
+    model: nn.Module,
+    prompt_ids: torch.Tensor,
+    completion_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+    attention_mask_prompt: torch.Tensor | None = None,
+    *,
+    micro_batch_size: int | None = None,
+) -> torch.Tensor:
+    """Memory-bounded ``compute_completion_logprobs``: run the forward on chunks
+    of ``micro_batch_size`` trajectories and concatenate the ``[N, T]`` result.
+
+    Bounds peak logits memory to ``micro_batch_size × T × V`` instead of
+    ``N × T × V`` (V≈152k → tens of GB; the wall that OOMs the reference /
+    sampler forwards at experiment scale). ``None`` (or ``>= N``) runs a single
+    forward, identical to ``compute_completion_logprobs``.
+
+    **No-grad only.** Intended for the reference and sampler-recompute forwards.
+    The result is correct under autograd, but concatenating grad-carrying chunks
+    retains *every* chunk's ``[K, T, V]`` graph until backward, so it gives no
+    memory benefit for the learner forward — that path needs per-chunk backward
+    (gradient accumulation); see docs/microbatching.md.
+    """
+    import torch
+
+    n = completion_ids.shape[0]
+    if micro_batch_size is None or micro_batch_size >= n:
+        return compute_completion_logprobs(
+            model, prompt_ids, completion_ids, completion_mask, attention_mask_prompt
+        )
+
+    pmask = attention_mask_prompt
+    chunks = []
+    for start in range(0, n, micro_batch_size):
+        sl = slice(start, start + micro_batch_size)
+        chunks.append(
+            compute_completion_logprobs(
+                model,
+                prompt_ids[sl],
+                completion_ids[sl],
+                completion_mask[sl],
+                None if pmask is None else pmask[sl],
+            )
+        )
+    return torch.cat(chunks, dim=0)
+
+
 @contextmanager
 def frozen_eval(model: nn.Module) -> Iterator[None]:
     """Context manager: temporarily eval mode + no_grad."""
@@ -427,6 +491,7 @@ def training_step(
     sampling_config: SamplingConfig,
     epochs: int = 1,
     max_grad_norm: float = 1.0,
+    logprob_micro_batch_size: int | None = None,
 ) -> dict[str, float]:
     """Execute one outer-loop training step.
 
@@ -453,36 +518,29 @@ def training_step(
     reward_output = reward_module.score(batch)
 
     with frozen_eval(reference):
-        reference_logprobs = compute_completion_logprobs(
+        reference_logprobs = microbatched_logprobs(
             reference,
             batch.prompt_token_ids,
             batch.completion_token_ids,
             batch.completion_mask,
             batch.prompt_attention_mask,
+            micro_batch_size=logprob_micro_batch_size,
         )
 
-    # Old/sampler logprobs for the IS ratio: recompute with the SAME forward as
-    # the learner (a no-grad full forward) rather than reuse the generation-time
-    # logprobs in batch.sampler_logprobs. The cached/bf16 generation path
-    # disagrees with the scoring forward by ~0.1-0.2 nats, which pushes the ratio
-    # off 1 even at epoch 0; recomputing makes the epoch-0 ratio ~1, as PPO/GRPO
-    # expects. (batch.sampler_logprobs remains the true sampling logprobs, for
-    # diagnostics.) Same train mode as the learner forward so the two agree.
-    student.train()
+    student.eval()
     with torch.no_grad():
-        sampler_logprobs = compute_completion_logprobs(
+        sampler_logprobs = microbatched_logprobs(
             student,
             batch.prompt_token_ids,
             batch.completion_token_ids,
             batch.completion_mask,
             batch.prompt_attention_mask,
+            micro_batch_size=logprob_micro_batch_size,
         )
 
     if epochs < 1:
         raise ValueError("epochs must be >= 1")
 
-    # Bound before the loop: pyright can't prove range(epochs) iterates even
-    # with the guard above, and an epochs=0 step would otherwise be unbound.
     diagnostics: dict[str, float] = {}
     for _ in range(epochs):
         student.train()
@@ -505,12 +563,27 @@ def training_step(
         )
 
         loss.backward()
-        # error_if_nonfinite: fail loudly at the source on a NaN/inf gradient
-        # rather than silently corrupting weights and crashing a step later in
-        # generate (as a -inf sampler logprob once did).
-        torch.nn.utils.clip_grad_norm_(student.parameters(), max_grad_norm, error_if_nonfinite=True)
-        optimizer.step()
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            student.parameters(), max_grad_norm, error_if_nonfinite=False
+        )
+        if torch.isfinite(grad_norm):
+            optimizer.step()
+            skipped_nonfinite = False
+        else:
+            logger.warning("non-finite grad norm (%.3g); skipping optimizer step", float(grad_norm))
+            skipped_nonfinite = True
+
         optimizer.zero_grad()
+        diagnostics["grad_norm"] = float(grad_norm)
+        diagnostics["skipped_nonfinite"] = float(skipped_nonfinite)
+
+    lengths = batch.completion_mask.sum(dim=1).float()
+    diagnostics["response_len_mean"] = float(lengths.mean().item())
+    diagnostics["response_len_max"] = float(lengths.max().item())
+    diagnostics["frac_truncated"] = float(
+        (lengths >= sampling_config.max_tokens).float().mean().item()
+    )
 
     return diagnostics
 
@@ -622,6 +695,7 @@ def train(
                 sampling_config=sampling_config,
                 epochs=config.epochs_per_rollout,
                 max_grad_norm=config.max_grad_norm,
+                logprob_micro_batch_size=config.logprob_micro_batch_size,
             )
             step_seconds = time.perf_counter() - t_step
 
@@ -635,6 +709,28 @@ def train(
             if wandb_run is not None:
                 wandb_run.log(record, step=rollout_step)
 
+            # Progress line for the Modal log stream: fraction done, ETA from the
+            # running-average step time, and the assurance metrics. (W&B has the
+            # live curves; this is for tailing `modal app logs`.)
+            done = rollout_step + 1
+            elapsed = time.perf_counter() - t_start
+            eta = elapsed / done * (config.num_rollouts - done)
+            logger.info(
+                "[%d/%d %.0f%%] reward=%.3f adv_std=%.3f loss=%.2e kl=%.2e clip=%.2f "
+                "| step %s elapsed %s eta %s",
+                done,
+                config.num_rollouts,
+                100.0 * done / config.num_rollouts,
+                diag.get("mean_reward", float("nan")),
+                diag.get("advantage_std", float("nan")),
+                diag.get("loss", float("nan")),
+                diag.get("kl_to_ref", float("nan")),
+                diag.get("ratio_clip_fraction", float("nan")),
+                _fmt_duration(step_seconds),
+                _fmt_duration(elapsed),
+                _fmt_duration(eta),
+            )
+
             if (rollout_step + 1) % config.eval_interval_rollouts == 0:
                 last_eval = run_periodic_eval(
                     student,
@@ -647,6 +743,11 @@ def train(
                     seed=config.seed,
                     rollout_step=rollout_step,
                 )
+                # Persist eval to metrics.jsonl too (not just W&B) so the run dir
+                # is a self-contained record. Eval lines carry `eval/*` keys;
+                # training-step lines carry bare keys — analysis filters on that.
+                metrics_f.write(json.dumps(last_eval) + "\n")
+                metrics_f.flush()
                 if wandb_run is not None:
                     wandb_run.log(last_eval, step=rollout_step)
                 logger.info("Eval @ step %d: %s", rollout_step, last_eval)
@@ -673,6 +774,8 @@ def train(
         seed=config.seed,
         rollout_step=config.num_rollouts - 1,
     )
+    with metrics_path.open("a") as f:  # metrics_f is closed by now; append the final eval
+        f.write(json.dumps(final_eval) + "\n")
     final_ckpt = save_checkpoint(
         student,
         tokenizer,
