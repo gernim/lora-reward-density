@@ -80,6 +80,7 @@ def run_training(
     advantage_eps: float,
     seed: int,
     train_levels: tuple[int, ...] | None,
+    logprob_micro_batch_size: int | None,
     eval_num_prompts: int,
     eval_interval_rollouts: int,
     checkpoint_interval_rollouts: int,
@@ -89,8 +90,13 @@ def run_training(
     run_id: str,
 ) -> dict:
     """Heavy training pass on a single H100. Returns a summary dict."""
+    import logging
     import os
     from pathlib import Path
+
+    # Surface INFO logs in the Modal stream (root defaults to WARNING, which hid
+    # the per-step progress line + "Loading student"/"Eval @ step" diagnostics).
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     os.environ["HF_HOME"] = "/hf-cache/huggingface"
     os.environ["HF_HUB_CACHE"] = "/hf-cache/huggingface/hub"
@@ -131,6 +137,7 @@ def run_training(
         advantage_eps=advantage_eps,
         seed=seed,
         train_levels=train_levels,
+        logprob_micro_batch_size=logprob_micro_batch_size,
         eval_interval_rollouts=eval_interval_rollouts,
         eval_num_prompts=eval_num_prompts,
         checkpoint_interval_rollouts=checkpoint_interval_rollouts,
@@ -264,8 +271,21 @@ class _TrainerGenerateRollout:
         if do_sample:
             gen_kwargs["temperature"] = config.temperature
             gen_kwargs["top_p"] = config.top_p
-        with torch.no_grad():
-            gen = self._model.generate(**gen_kwargs)
+        # Generate in EVAL mode. `load_student` enables gradient checkpointing,
+        # which is gated on `self.training`; generating while the model is in
+        # train() mode runs the checkpoint path during a no-grad forward and
+        # produces GARBAGE completions (degenerate loops / token salad → 0
+        # reward). The training loop calls rollout() with the student in train()
+        # mode, so flip to eval() here and restore. (Eval already rolls out
+        # under eval mode, which is why only training was affected.)
+        was_training = self._model.training
+        self._model.eval()
+        try:
+            with torch.no_grad():
+                gen = self._model.generate(**gen_kwargs)
+        finally:
+            if was_training:
+                self._model.train()
 
         completion_ids = gen.sequences[:, prompt_ids.shape[1] :]  # [P*G, T]
         completion_mask = completion_ids != self._tokenizer.pad_token_id
@@ -299,8 +319,98 @@ class _TrainerGenerateRollout:
 
 
 # ----------------------------------------------------------------------------
+# Rollout+reward reproduction (debug) — run: modal run modal_app/train.py::debug_rollout
+# ----------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A10G",
+    timeout=1800,
+    volumes={"/hf-cache": hf_cache, "/training-runs": runs_volume},
+)
+def debug_rollout(
+    *,
+    model_id: str = "Qwen/Qwen3-1.7B-Base",
+    lora_rank: int = 16,
+    num_prompts: int = 2,
+    samples_per_prompt: int = 4,
+    temperature: float = 1.0,
+    max_tokens: int = 4096,
+    levels: str = "1,2,3",
+) -> None:
+    """Reproduce ONE training-step rollout+reward EXACTLY — `load_student`
+    (LoRA + gradient checkpointing) → the real `_TrainerGenerateRollout` engine
+    → `OutcomeRewardModule` on the resulting RolloutBatch — and print every
+    completion's gold / correctness / reward. Standalone reward_debug.py gets
+    ~30-40% on this data; the training run got 0%, so the bug is in this exact
+    path (model loading / engine / reward-on-real-batch), which the standalone
+    proxies didn't exercise.
+    """
+    import os
+
+    os.environ["HF_HOME"] = "/hf-cache/huggingface"
+    os.environ["HF_HUB_CACHE"] = "/hf-cache/huggingface/hub"
+
+    from lora_reward_density.data import load_math_train
+    from lora_reward_density.outcome_reward import OutcomeRewardModule
+    from lora_reward_density.rollout import SamplingConfig
+    from lora_reward_density.train import TrainRunConfig, load_student
+
+    parsed_levels = [int(x.strip()) for x in levels.split(",")]
+    student, tokenizer = load_student(
+        model_id,
+        lora_rank=lora_rank,
+        lora_alpha=32,
+        lora_dropout=0.0,
+        lora_target_modules=TrainRunConfig().lora_target_modules,
+    )
+    engine = _TrainerGenerateRollout(student, tokenizer)
+
+    examples = load_math_train(
+        num_examples=num_prompts, levels=parsed_levels, seed=0, cache_dir="/hf-cache/datasets"
+    )
+    prompts = [ex.prompt for ex in examples]
+    metadata = [ex.metadata for ex in examples]
+
+    cfg = SamplingConfig(
+        n=samples_per_prompt, max_tokens=max_tokens, temperature=temperature, top_p=0.95, seed=0
+    )
+    batch = engine.rollout(prompts, metadata, cfg)
+    reward_output = OutcomeRewardModule().score(batch)
+    correctness = reward_output.metadata.get("correctness")
+
+    print(f"\nnum_completions={batch.num_completions} group_index={batch.group_index.tolist()}")
+    print(f"parse_failures={reward_output.metadata.get('parse_failures')}")
+    for i in range(batch.num_completions):
+        pi = int(batch.group_index[i].item())
+        comp = batch.completions[i]
+        is_correct = bool(correctness[i]) if correctness is not None else None
+        has_box = "\\boxed" in comp
+        print(f"\n--- completion {i} (prompt {pi}, level {metadata[pi].get('level')}) ---")
+        print("  gold:", repr(metadata[pi]["gold_answer"]))
+        print(f"  correct={is_correct} reward={float(reward_output.trajectory_rewards[i].item())}")
+        print(f"  chars={len(comp)} has_boxed={has_box}")
+        print("  tail:", repr(comp[-250:]))
+    print(f"\nMEAN_REWARD = {float(reward_output.trajectory_rewards.mean().item())}")
+
+
+# ----------------------------------------------------------------------------
 # Local entrypoint
 # ----------------------------------------------------------------------------
+
+
+def _pull_metrics_into(run_path, run_id: str) -> None:
+    """Best-effort: copy the remote `metrics.jsonl` (written by the container to
+    the `lrd-training-runs` volume) into the local run dir, which otherwise only
+    has the launch-time snapshot + an empty placeholder. Never raises — a missing
+    file (run died early) just prints and moves on."""
+    try:
+        data = b"".join(runs_volume.read_file(f"{run_id}/metrics.jsonl"))
+    except Exception as e:  # noqa: BLE001 — best-effort; volume file may not exist yet
+        print(f"  (metrics.jsonl not pulled for {run_id}: {e})")
+        return
+    (run_path / "metrics.jsonl").write_bytes(data)
+    print(f"  pulled {data.count(chr(10).encode())} step(s) of metrics -> {run_path}/metrics.jsonl")
 
 
 @app.local_entrypoint()
@@ -319,14 +429,27 @@ def main(
     advantage_eps: float = 1e-8,
     seed: int = 0,
     train_levels: str | None = None,
+    logprob_micro_batch_size: int | None = None,
     eval_num_prompts: int = 100,
     eval_interval_rollouts: int = 20,
     checkpoint_interval_rollouts: int = 50,
     student_model_id: str = "Qwen/Qwen3-1.7B-Base",
     wandb_project: str | None = "lora-reward-density",
     wandb_run_name: str | None = None,
+    matrix: bool = False,
+    matrix_regimes: str = "outcome",
+    matrix_ranks: str = "1,4,16,64,256",
+    matrix_fullft_seeds: str = "0,1,2",
 ) -> None:
-    """Kick off a single matrix cell on Modal.
+    """Kick off a single matrix cell on Modal — or the whole matrix with --matrix.
+
+    Single cell (default): one `run_training` call, blocks for the result.
+    Matrix (`--matrix`): fan out the cells across Modal containers (parallel up
+    to your GPU quota), then gather. `regime`/`rank`/`full_ft`/`seed` are ignored
+    in matrix mode; the cells come from `matrix_*`. All other args (num_rollouts,
+    max_tokens, learning_rate, ...) are the *shared* per-cell config — pass the
+    values your curve run validated. Use `modal run --detach` for long matrices
+    so it survives a disconnect.
 
     Args:
         regime: one of {outcome, process, distillation}.
@@ -339,20 +462,100 @@ def main(
         advantage_eps: added to group-std denominator for stability.
         train_levels: comma-separated MATH difficulty levels to train on, e.g.
             ``"1,2,3"`` (difficulty filter, experiments.md D7). Omit for all
-            levels. Restricting to the model's learnable band gives GRPO
-            within-group reward variance.
+            levels — the re-baseline showed filtering isn't needed.
+        matrix: launch the full matrix instead of one cell.
+        matrix_regimes: comma-separated regimes for the matrix (only `outcome`
+            is implemented; process/distillation cells will error until built).
+        matrix_ranks: comma-separated LoRA ranks → one cell each (seed 0).
+        matrix_fullft_seeds: comma-separated seeds → one FullFT cell each.
     """
     import json
     from pathlib import Path
 
     from lora_reward_density.run_dir import create_run_dir
 
-    lora_rank = None if full_ft else rank
     parsed_levels = tuple(int(x.strip()) for x in train_levels.split(",")) if train_levels else None
+
+    # Config shared by every cell; only regime/lora_rank/seed/run_id/run_name vary.
+    shared = {
+        "num_rollouts": num_rollouts,
+        "batch_prompts": batch_prompts,
+        "samples_per_prompt": samples_per_prompt,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "learning_rate": learning_rate,
+        "clip_epsilon": clip_epsilon,
+        "kl_beta": kl_beta,
+        "advantage_eps": advantage_eps,
+        "train_levels": parsed_levels,
+        "logprob_micro_batch_size": logprob_micro_batch_size,
+        "eval_num_prompts": eval_num_prompts,
+        "eval_interval_rollouts": eval_interval_rollouts,
+        "checkpoint_interval_rollouts": checkpoint_interval_rollouts,
+        "student_model_id": student_model_id,
+        "wandb_project": wandb_project,
+    }
+
+    def _make_run(regime_: str, lora_rank_: int | None, seed_: int):
+        label = f"{regime_}_{'fullft' if lora_rank_ is None else f'rank{lora_rank_}'}_seed{seed_}"
+        run = create_run_dir(
+            "runs",
+            suffix=label,  # unique, self-describing run_id per cell (same-second-safe)
+            config={
+                "regime": regime_,
+                "lora_rank": lora_rank_,
+                "seed": seed_,
+                "cell_label": label,
+                **shared,
+            },
+        )
+        return label, run
+
+    if matrix:
+        regimes = [r.strip() for r in matrix_regimes.split(",") if r.strip()]
+        ranks = [int(r) for r in matrix_ranks.split(",") if r.strip()]
+        fullft_seeds = [int(s) for s in matrix_fullft_seeds.split(",") if s.strip()]
+        cells: list[tuple[str, int | None, int]] = []
+        for rg in regimes:
+            cells += [(rg, rk, 0) for rk in ranks]  # LoRA cells, seed 0
+            cells += [(rg, None, sd) for sd in fullft_seeds]  # FullFT cells
+
+        print(f"Matrix: launching {len(cells)} cells in parallel (bounded by GPU quota)...")
+        handles = []
+        for rg, rk, sd in cells:
+            label, run = _make_run(rg, rk, sd)
+            call = run_training.spawn(
+                regime=rg, lora_rank=rk, seed=sd, run_id=run.run_id, wandb_run_name=label, **shared
+            )
+            handles.append((label, run, call))
+            print(f"  spawned {label} → {run.path}")
+
+        print("\nGathering (blocking until all cells finish; safe to detach)...")
+        results = {}
+        for label, run, call in handles:
+            try:
+                summary = call.get()
+                (run.path / "training_summary.json").write_text(
+                    json.dumps(summary, indent=2, sort_keys=True, default=str)
+                )
+                _pull_metrics_into(run.path, run.run_id)
+                results[label] = summary.get("final_eval")
+                print(f"  DONE   {label}: final_eval={summary.get('final_eval')}")
+            except Exception as e:  # noqa: BLE001 — one cell failing shouldn't abort the matrix
+                results[label] = f"FAILED: {e}"
+                print(f"  FAILED {label}: {e}")
+        print(
+            f"\nMatrix complete: {sum(1 for v in results.values() if not str(v).startswith('FAILED'))}"
+            f"/{len(cells)} cells succeeded."
+        )
+        return
+
+    lora_rank = None if full_ft else rank
     cell_label = f"{regime}_{'fullft' if full_ft else f'rank{rank}'}_seed{seed}"
 
     run = create_run_dir(
         "runs",
+        suffix=cell_label,  # self-describing dir name, consistent with matrix mode
         config={
             "regime": regime,
             "lora_rank": lora_rank,
@@ -367,6 +570,7 @@ def main(
             "kl_beta": kl_beta,
             "advantage_eps": advantage_eps,
             "train_levels": parsed_levels,
+            "logprob_micro_batch_size": logprob_micro_batch_size,
             "student_model_id": student_model_id,
             "cell_label": cell_label,
         },
@@ -387,6 +591,7 @@ def main(
         advantage_eps=advantage_eps,
         seed=seed,
         train_levels=parsed_levels,
+        logprob_micro_batch_size=logprob_micro_batch_size,
         eval_num_prompts=eval_num_prompts,
         eval_interval_rollouts=eval_interval_rollouts,
         checkpoint_interval_rollouts=checkpoint_interval_rollouts,
@@ -398,6 +603,7 @@ def main(
 
     summary_path = run.path / "training_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+    _pull_metrics_into(run.path, run.run_id)
     print(f"\nWrote {summary_path}")
     print(f"  final_eval = {summary.get('final_eval')}")
     print(f"  total_seconds = {summary.get('total_seconds')}")
