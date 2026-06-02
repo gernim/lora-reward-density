@@ -145,16 +145,23 @@ def run_training(
         wandb_run_name=wandb_run_name,
     )
 
-    # Reward module — regime dispatch. Process / distillation modules don't
-    # exist yet (Tier 2, see design.md §9.1 / §9.2); fall through with a
-    # clear error for now.
+    # Reward module — regime dispatch. Distillation is still Tier 2.
     if regime == "outcome":
         reward_module = OutcomeRewardModule()
     elif regime == "process":
-        raise NotImplementedError(
-            "Process reward module not yet built (Tier 2). "
-            "See design.md §9.1 for the planned interface."
+        from transformers import AutoTokenizer
+
+        from lora_reward_density.process_reward import (
+            ProcessRewardConfig,
+            ProcessRewardModule,
         )
+
+        # ProcessRewardModule segments completions in token space, so it needs
+        # the student tokenizer (same model_id train() loads internally → ids
+        # match). The 7B PRM loads lazily on first score(), on this GPU container
+        # alongside the student + reference (watch H100 memory — see D11).
+        student_tokenizer = AutoTokenizer.from_pretrained(student_model_id)
+        reward_module = ProcessRewardModule(ProcessRewardConfig(), tokenizer=student_tokenizer)
     elif regime == "distillation":
         raise NotImplementedError(
             "Distillation reward module not yet built (Tier 2). "
@@ -337,14 +344,18 @@ def debug_rollout(
     temperature: float = 1.0,
     max_tokens: int = 4096,
     levels: str = "1,2,3",
+    regime: str = "outcome",
 ) -> None:
     """Reproduce ONE training-step rollout+reward EXACTLY — `load_student`
     (LoRA + gradient checkpointing) → the real `_TrainerGenerateRollout` engine
-    → `OutcomeRewardModule` on the resulting RolloutBatch — and print every
-    completion's gold / correctness / reward. Standalone reward_debug.py gets
-    ~30-40% on this data; the training run got 0%, so the bug is in this exact
-    path (model loading / engine / reward-on-real-batch), which the standalone
-    proxies didn't exercise.
+    → the regime's reward module on the resulting RolloutBatch — and print the
+    per-completion reward detail.
+
+    `--regime outcome` (default) prints gold / correctness / reward.
+    `--regime process` prints the token-space step segmentation, the separator
+    token, and each step's deposited PRM score — the check before trusting the
+    configured step separator and the `ки` tag-count alignment on real Qwen3
+    output (watch for LaTeX/equations split mid-expression by a single `\\n`).
     """
     import os
 
@@ -352,7 +363,6 @@ def debug_rollout(
     os.environ["HF_HUB_CACHE"] = "/hf-cache/huggingface/hub"
 
     from lora_reward_density.data import load_math_train
-    from lora_reward_density.outcome_reward import OutcomeRewardModule
     from lora_reward_density.rollout import SamplingConfig
     from lora_reward_density.train import TrainRunConfig, load_student
 
@@ -376,10 +386,16 @@ def debug_rollout(
         n=samples_per_prompt, max_tokens=max_tokens, temperature=temperature, top_p=0.95, seed=0
     )
     batch = engine.rollout(prompts, metadata, cfg)
+    print(f"\nnum_completions={batch.num_completions} group_index={batch.group_index.tolist()}")
+
+    if regime == "process":
+        _debug_process(batch, tokenizer, metadata)
+        return
+
+    from lora_reward_density.outcome_reward import OutcomeRewardModule
+
     reward_output = OutcomeRewardModule().score(batch)
     correctness = reward_output.metadata.get("correctness")
-
-    print(f"\nnum_completions={batch.num_completions} group_index={batch.group_index.tolist()}")
     print(f"parse_failures={reward_output.metadata.get('parse_failures')}")
     for i in range(batch.num_completions):
         pi = int(batch.group_index[i].item())
@@ -392,6 +408,49 @@ def debug_rollout(
         print(f"  chars={len(comp)} has_boxed={has_box}")
         print("  tail:", repr(comp[-250:]))
     print(f"\nMEAN_REWARD = {float(reward_output.trajectory_rewards.mean().item())}")
+
+
+def _debug_process(batch, tokenizer, metadata) -> None:
+    """Print process-regime segmentation + per-step PRM deposits for one batch.
+
+    Shows the separator's token ids, then for each completion the token-space
+    step spans, each step's decoded text, and whether/what score was deposited
+    at the step's final token. This is the validation that the configured
+    separator segments Qwen3 output sensibly and the PRM produced one score per
+    step (and that single `\\n` doesn't split LaTeX mid-equation).
+    """
+    from lora_reward_density.process_reward import (
+        ProcessRewardConfig,
+        ProcessRewardModule,
+        _segment_token_spans,
+    )
+
+    cfg = ProcessRewardConfig()
+    sep_ids = tokenizer.encode(cfg.step_separator, add_special_tokens=False)
+    module = ProcessRewardModule(cfg, tokenizer=tokenizer)
+    reward_output = module.score(batch)  # loads the 7B PRM lazily here
+    token_rewards = reward_output.token_rewards
+    step_mask = reward_output.step_reward_mask
+    step_counts = reward_output.metadata["step_counts"]
+
+    print(f"separator={cfg.step_separator!r} -> token ids {sep_ids}")
+    for i in range(batch.num_completions):
+        pi = int(batch.group_index[i].item())
+        valid_len = int(batch.completion_mask[i].sum().item())
+        ids = batch.completion_token_ids[i, :valid_len].tolist()
+        spans = _segment_token_spans(ids, sep_ids)
+        print(f"\n--- completion {i} (prompt {pi}, level {metadata[pi].get('level')}) ---")
+        print(
+            f"  valid_tokens={valid_len} steps={int(step_counts[i])} deposit_sum={float(reward_output.trajectory_rewards[i]):.3f}"
+        )
+        for j, (s, e) in enumerate(spans):
+            step_txt = tokenizer.decode(ids[s : e + 1]).strip()
+            deposited = bool(step_mask[i, e])
+            score = float(token_rewards[i, e])
+            print(
+                f"    step {j} tok[{s}:{e}] deposited={deposited} score={score:.3f} text={step_txt[:120]!r}"
+            )
+    print(f"\nMEAN deposit_sum = {float(reward_output.trajectory_rewards.mean().item())}")
 
 
 # ----------------------------------------------------------------------------
