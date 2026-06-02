@@ -501,6 +501,7 @@ def main(
     matrix: bool = False,
     matrix_regimes: str = "outcome",
     matrix_ranks: str = "1,4,16,64,256",
+    matrix_lora_seeds: str = "0",
     matrix_fullft_seeds: str = "0,1,2",
 ) -> None:
     """Kick off a single matrix cell on Modal — or the whole matrix with --matrix.
@@ -526,9 +527,11 @@ def main(
             ``"1,2,3"`` (difficulty filter, experiments.md D7). Omit for all
             levels — the re-baseline showed filtering isn't needed.
         matrix: launch the full matrix instead of one cell.
-        matrix_regimes: comma-separated regimes for the matrix (only `outcome`
-            is implemented; process/distillation cells will error until built).
-        matrix_ranks: comma-separated LoRA ranks → one cell each (seed 0).
+        matrix_regimes: comma-separated regimes for the matrix (`outcome` and
+            `process` are implemented; `distillation` errors until built).
+        matrix_ranks: comma-separated LoRA ranks → one LoRA cell per (rank, seed).
+        matrix_lora_seeds: comma-separated seeds for the LoRA cells (default "0";
+            use "0,1,2" for LoRA error bars).
         matrix_fullft_seeds: comma-separated seeds → one FullFT cell each.
     """
     import json
@@ -576,10 +579,11 @@ def main(
     if matrix:
         regimes = [r.strip() for r in matrix_regimes.split(",") if r.strip()]
         ranks = [int(r) for r in matrix_ranks.split(",") if r.strip()]
+        lora_seeds = [int(s) for s in matrix_lora_seeds.split(",") if s.strip()]
         fullft_seeds = [int(s) for s in matrix_fullft_seeds.split(",") if s.strip()]
         cells: list[tuple[str, int | None, int]] = []
         for rg in regimes:
-            cells += [(rg, rk, 0) for rk in ranks]  # LoRA cells, seed 0
+            cells += [(rg, rk, sd) for rk in ranks for sd in lora_seeds]  # LoRA cells
             cells += [(rg, None, sd) for sd in fullft_seeds]  # FullFT cells
 
         print(f"Matrix: launching {len(cells)} cells in parallel (bounded by GPU quota)...")
