@@ -33,11 +33,21 @@ class RewardOutput:
 
     `step_reward_mask` is optional for back-compat; when None the loss may fall
     back to treating every valid token as a deposit.
+
+    `per_token_advantage` tells the loss how to turn deposits into advantages.
+    When False (default — *sparse* rewards, outcome/process) it reverse-cumsums
+    the normalized deposits (return-to-go, DeepSeekMath §4.1.3). When True
+    (*dense* per-token rewards — distillation) it uses the normalized deposits
+    directly: reverse-cumsum over every-token deposits makes the advantage scale
+    with sequence length (~√T → `adv_std` ~50, vs ~1 for outcome), which is
+    unstable and not comparable across regimes (see D14). Distillation wants the
+    standard per-token objective, so it sets this True.
     """
 
     token_rewards: torch.Tensor  # [N, T] float, deposits at masked positions
     trajectory_rewards: torch.Tensor  # [N] float, scalar summary (logging)
     step_reward_mask: torch.Tensor | None = None  # [N, T] bool, deposit positions
+    per_token_advantage: bool = False  # True → loss uses normalized deposits, no reverse-cumsum
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

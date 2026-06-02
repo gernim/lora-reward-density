@@ -140,6 +140,9 @@ class DistillationRewardModule:
             token_rewards=token_rewards,
             trajectory_rewards=token_rewards.sum(dim=1),  # masked sum (logging)
             step_reward_mask=mask.bool(),  # every valid token is a deposit
+            # Dense per-token reward → per-token advantage (no reverse-cumsum),
+            # else the cumsum over T deposits blows the advantage to ~√T (D14).
+            per_token_advantage=True,
             metadata={
                 "regime": self.name,
                 "mean_token_reward": float(token_rewards.sum().item() / valid.item()),

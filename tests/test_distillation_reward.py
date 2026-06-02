@@ -82,6 +82,8 @@ def test_score_builds_per_token_deposits():
     assert out.step_reward_mask[0].tolist() == [True, True, False]
     assert out.trajectory_rewards.item() == pytest.approx(3.0)  # masked sum
     assert out.token_rewards.device.type == "cpu"
+    # Dense per-token reward → loss uses per-token advantage (no reverse-cumsum).
+    assert out.per_token_advantage is True
     assert out.metadata["regime"] == "distillation"
     assert out.metadata["mean_token_reward"] == pytest.approx(1.5)  # (1+2)/2 valid
 
