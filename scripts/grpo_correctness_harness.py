@@ -53,10 +53,21 @@ def _build_toy_batch():
     trajectory_rewards = torch.tensor(
         [1.0, 0.5, 0.5, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0]
     )
-    token_rewards = trajectory_rewards.unsqueeze(1) * batch.completion_mask.float()
+    # Deposit-at-last-token contract (DeepSeekMath §4.1.3): outcome is the
+    # one-step case. The user's loss group-normalizes these deposits and
+    # reverse-cumsums; for outcome that must reproduce TRL's broadcast
+    # group-relative advantage below (the Δ=0 check).
+    token_rewards = torch.zeros(n, t)
+    step_reward_mask = torch.zeros(n, t, dtype=torch.bool)
+    for i in range(n):
+        nz = batch.completion_mask[i].nonzero(as_tuple=False)
+        last = int(nz[-1].item())
+        token_rewards[i, last] = trajectory_rewards[i]
+        step_reward_mask[i, last] = True
     reward_output = RewardOutput(
         token_rewards=token_rewards,
         trajectory_rewards=trajectory_rewards,
+        step_reward_mask=step_reward_mask,
         metadata={"regime": "outcome"},
     )
 

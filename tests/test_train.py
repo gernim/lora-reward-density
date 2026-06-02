@@ -70,8 +70,21 @@ class _StubReward:
     def score(self, batch) -> RewardOutput:
         n = batch.num_completions
         traj = torch.arange(n, dtype=torch.float32)
-        token_rewards = traj.unsqueeze(1) * batch.completion_mask.float()
-        return RewardOutput(token_rewards=token_rewards, trajectory_rewards=traj)
+        # Deposit each trajectory reward at its last valid token + mark it (the
+        # dense contract; mirrors outcome_reward). Varied rewards keep the
+        # within-group advantage std non-zero so the surrogate has real gradient.
+        mask = batch.completion_mask
+        token_rewards = torch.zeros(mask.shape, dtype=torch.float32)
+        step_reward_mask = torch.zeros(mask.shape, dtype=torch.bool)
+        for i in range(n):
+            last = int(mask[i].nonzero(as_tuple=False)[-1].item())
+            token_rewards[i, last] = traj[i]
+            step_reward_mask[i, last] = True
+        return RewardOutput(
+            token_rewards=token_rewards,
+            trajectory_rewards=traj,
+            step_reward_mask=step_reward_mask,
+        )
 
 
 def _make_step_kwargs(*, epochs: int = 1):

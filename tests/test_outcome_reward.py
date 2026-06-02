@@ -68,17 +68,21 @@ def test_outcome_reward_custom_reward_values():
     assert output.trajectory_rewards.tolist() == [10.0]
 
 
-def test_outcome_reward_token_rewards_zero_at_pad():
-    """trajectory_reward broadcasts onto valid tokens, zero on pad."""
+def test_outcome_reward_deposits_at_last_valid_token():
+    """Outcome is the one-step case: reward deposited at the last valid token."""
     canned = {"q": ["\\boxed{1} more text", "\\boxed{1}"]}  # lengths 3, 1
     golds = {"q": "1"}
     output = OutcomeRewardModule().score(_rollout(canned, golds))
 
     assert output.trajectory_rewards.tolist() == [1.0, 1.0]
-    # First completion: 3 valid tokens, all reward 1.0
-    assert torch.allclose(output.token_rewards[0], torch.tensor([1.0, 1.0, 1.0]))
-    # Second completion: 1 valid token, then pad
+    # First completion: 3 valid tokens → deposit at index 2, zeros before.
+    assert torch.allclose(output.token_rewards[0], torch.tensor([0.0, 0.0, 1.0]))
+    # Second completion: 1 valid token → deposit at index 0.
     assert torch.allclose(output.token_rewards[1], torch.tensor([1.0, 0.0, 0.0]))
+    # step_reward_mask marks exactly the deposit positions.
+    assert output.step_reward_mask is not None
+    assert output.step_reward_mask[0].tolist() == [False, False, True]
+    assert output.step_reward_mask[1].tolist() == [True, False, False]
 
 
 def test_outcome_reward_missing_gold_answer_raises():

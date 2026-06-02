@@ -87,13 +87,27 @@ class OutcomeRewardModule:
             correctness[i] = ok
             traj[i] = cfg.correct_reward if ok else cfg.incorrect_reward
 
-        # Reward modules emit CPU tensors (design.md §683); completion_mask may
-        # live on the rollout device (GPU in the Modal generate path), so pull
-        # it to CPU before the product to avoid a cross-device multiply.
-        token_rewards = traj.unsqueeze(1) * batch.completion_mask.float().cpu()
+        # Outcome is the one-step case of the dense contract (DeepSeekMath
+        # §4.1.3): deposit each trajectory reward at its last valid token, zeros
+        # elsewhere. The loss group-normalizes the deposits and reverse-cumsums,
+        # which broadcasts the normalized scalar back across the trajectory's
+        # tokens — identical to the old broadcast, but unified with the process
+        # regime. Reward modules emit CPU tensors (design.md §6); completion_mask
+        # may live on the rollout device (GPU), so pull it to CPU first.
+        mask_cpu = batch.completion_mask.cpu()
+        token_rewards = torch.zeros(mask_cpu.shape, dtype=torch.float32)
+        step_reward_mask = torch.zeros(mask_cpu.shape, dtype=torch.bool)
+        for i in range(n):
+            valid = mask_cpu[i].nonzero(as_tuple=False)
+            if valid.numel() == 0:
+                continue  # degenerate empty completion: no token to deposit on
+            last = int(valid[-1].item())
+            token_rewards[i, last] = traj[i]
+            step_reward_mask[i, last] = True
         return RewardOutput(
             token_rewards=token_rewards,
             trajectory_rewards=traj,
+            step_reward_mask=step_reward_mask,
             metadata={
                 "correctness": correctness,
                 "parse_failures": parse_failures,
