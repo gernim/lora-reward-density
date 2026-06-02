@@ -20,6 +20,8 @@ vLLM/FlashInfer/DeepGEMM JIT works. Adds peft/accelerate/trl and a
 
 from __future__ import annotations
 
+from typing import Any
+
 import modal
 
 image = (
@@ -48,6 +50,88 @@ hf_cache = modal.Volume.from_name("lrd-hf-cache", create_if_missing=True)
 runs_volume = modal.Volume.from_name("lrd-training-runs", create_if_missing=True)
 
 app = modal.App("lora-reward-density-train", image=image)
+
+
+# ----------------------------------------------------------------------------
+# Distillation teacher — Qwen3-8B on its OWN GPU (the offload, design §9.3 / D11)
+# ----------------------------------------------------------------------------
+# A Modal class so the 8B loads once per warm container (@enter) and is reused
+# across the ~100 per-rollout logprob calls. Kept off the training GPU so process
+# memory stays equivalent to outcome. Qwen3-8B shares the Qwen3 vocab with the
+# 1.7B student, so the student's completion_token_ids are valid teacher inputs.
+@app.cls(
+    gpu="A100-80GB",  # 8B bf16 (~16 GB) + [N,T,V] logits — microbatched; A100 has headroom
+    timeout=28800,
+    volumes={"/hf-cache": hf_cache},
+)
+class Teacher:
+    @modal.enter()
+    def load(self):
+        import os
+
+        import torch
+        from transformers import AutoModelForCausalLM
+
+        os.environ["HF_HOME"] = "/hf-cache/huggingface"
+        os.environ["HF_HUB_CACHE"] = "/hf-cache/huggingface/hub"
+        # transformers' from_pretrained return type trips pyright on the chained
+        # .to()/.eval() (GPU-only path); annotate Any.
+        model: Any = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen3-8B", torch_dtype=torch.bfloat16
+        )
+        self.model = model.to("cuda").eval()
+
+    @modal.method()
+    def logprobs(
+        self,
+        prompt_ids,
+        completion_ids,
+        completion_mask,
+        prompt_attention_mask,
+        micro_batch_size: int = 4,
+    ):
+        """Teacher-forced log π_T(a_t | s_t) on the completion tokens → [N, T].
+
+        Reuses the student-side `microbatched_logprobs` so the teacher and policy
+        logprobs share the exact gather + left-pad position_ids convention — the
+        distillation reward r_t = log π_T − log π_θ is only meaningful if both use
+        the same logprob definition.
+        """
+        import torch
+
+        from lora_reward_density.train import microbatched_logprobs
+
+        with torch.no_grad():
+            lp = microbatched_logprobs(
+                self.model,
+                prompt_ids.to("cuda"),
+                completion_ids.to("cuda"),
+                completion_mask.to("cuda"),
+                prompt_attention_mask.to("cuda"),
+                micro_batch_size=micro_batch_size,
+            )
+        return lp.cpu()
+
+
+class _ModalTeacherClient:
+    """`TeacherClient` backed by the Modal `Teacher` class (separate GPU).
+
+    Holds one `Teacher()` handle so calls reuse the same warm container (8B loaded
+    once). Passes CPU tensors over the RPC; gets back [N, T] teacher logprobs.
+    """
+
+    def __init__(self, teacher, micro_batch_size: int = 4) -> None:
+        self._teacher = teacher
+        self._mbs = micro_batch_size
+
+    def logprobs(self, batch):
+        return self._teacher.logprobs.remote(
+            batch.prompt_token_ids.cpu(),
+            batch.completion_token_ids.cpu(),
+            batch.completion_mask.cpu(),
+            batch.prompt_attention_mask.cpu(),
+            self._mbs,
+        )
 
 
 # The `wandb` Modal secret (containing WANDB_API_KEY) is injected into the
@@ -163,10 +247,12 @@ def run_training(
         student_tokenizer = AutoTokenizer.from_pretrained(student_model_id)
         reward_module = ProcessRewardModule(ProcessRewardConfig(), tokenizer=student_tokenizer)
     elif regime == "distillation":
-        raise NotImplementedError(
-            "Distillation reward module not yet built (Tier 2). "
-            "See design.md §9.2 + §9.3 for the planned interface."
-        )
+        from lora_reward_density.distillation_reward import DistillationRewardModule
+
+        # Teacher runs on its own GPU (Modal class above); one handle so calls
+        # reuse the warm 8B. Policy logprobs are bound by train() post load_student
+        # (bind_policy) — score(batch) stays signature-stable.
+        reward_module = DistillationRewardModule(teacher=_ModalTeacherClient(Teacher()))
     else:
         raise ValueError(f"Unknown regime: {regime!r}")
 

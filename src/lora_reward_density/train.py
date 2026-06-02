@@ -664,6 +664,13 @@ def train(
 
     rollout_engine = rollout_engine_factory(student, tokenizer)
 
+    # Distillation's reward needs current-student logprobs (log π_θ); bind the
+    # loaded student so score() can recompute them. Duck-typed via getattr —
+    # other regimes have no bind_policy, so the loss/step stay regime-agnostic.
+    bind_policy = getattr(reward_module, "bind_policy", None)
+    if bind_policy is not None:
+        bind_policy(student)
+
     # W&B init (optional — disabled if no wandb installed or no project).
     wandb_run = _maybe_init_wandb(config, run_dir)
 
