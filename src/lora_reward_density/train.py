@@ -443,6 +443,7 @@ def run_periodic_eval(
             "eval/rollout_step": rollout_step,
         }
     """
+    from lora_reward_density.outcome_reward import OutcomeRewardModule
     from lora_reward_density.rollout import SamplingConfig
 
     cfg = SamplingConfig(
@@ -454,18 +455,22 @@ def run_periodic_eval(
     )
     with frozen_eval(model):
         batch = rollout_engine.rollout(eval_prompts, eval_metadata, cfg)
-    reward_output = reward_module.score(batch)
 
-    # n=1, so correctness is one greedy sample per prompt → pass@1 directly.
-    # Regimes without `correctness` (process / distillation) report NaN here.
-    correctness = reward_output.metadata.get("correctness")
-    pass_at_1 = float("nan") if correctness is None else float(correctness.float().mean().item())
+    # pass@1 is held-out *task accuracy* — the cross-regime comparison metric — so
+    # eval ALWAYS scores outcome-correctness (math-verify on the greedy answer),
+    # regardless of the training regime. This is what makes the outcome / process
+    # / distillation rows comparable, and it avoids running a 7B PRM / teacher at
+    # eval. (`reward_module` is kept in the signature for interface stability but
+    # is intentionally not used for scoring here — process emits no `correctness`,
+    # which is why deriving pass@1 from it produced NaN.)
+    eval_reward = OutcomeRewardModule().score(batch)
+    correctness = eval_reward.metadata["correctness"]
 
     return {
-        "eval/pass@1": pass_at_1,
-        "eval/mean_reward": float(reward_output.trajectory_rewards.mean().item()),
+        "eval/pass@1": float(correctness.float().mean().item()),
+        "eval/mean_reward": float(eval_reward.trajectory_rewards.mean().item()),
         "eval/parse_failure_rate": (
-            reward_output.metadata.get("parse_failures", 0) / max(batch.num_completions, 1)
+            eval_reward.metadata.get("parse_failures", 0) / max(batch.num_completions, 1)
         ),
         "eval/mean_response_length": float(batch.completion_mask.sum(dim=1).float().mean().item()),
         "eval/rollout_step": float(rollout_step),
