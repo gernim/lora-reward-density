@@ -57,8 +57,8 @@ app = modal.App("lora-reward-density-train", image=image)
 # `_maybe_init_wandb` degrades gracefully if the key is absent, so a missing or
 # misnamed key warns and continues rather than crashing the run.
 @app.function(
-    gpu="H100",
-    timeout=14400,  # 4 hr — covers a FullFT distillation run with margin
+    gpu="H200",  # 141 GB: fits student + reference + co-located 7B PRM at full scale (no offload)
+    timeout=28800,  # 8 hr — generation-bound steps (~2-8 min) × 100+ rollouts; margin for the overnight matrix
     volumes={
         "/hf-cache": hf_cache,
         "/training-runs": runs_volume,
@@ -477,10 +477,13 @@ def main(
     regime: str = "outcome",
     rank: int = 16,
     full_ft: bool = False,
-    num_rollouts: int = 200,
-    batch_prompts: int = 8,
-    samples_per_prompt: int = 8,
-    max_tokens: int = 4096,
+    # Agreed shrunk matrix config (project-plan §9): N=16 (4×4), ~1536 tok, ~100
+    # rollouts. ALL cells must share these for cross-regime comparability — the
+    # original 8×8/4096/200 was superseded; outcome cells already ran at 4×4.
+    num_rollouts: int = 100,
+    batch_prompts: int = 4,
+    samples_per_prompt: int = 4,
+    max_tokens: int = 1536,
     temperature: float = 0.7,
     learning_rate: float = 1e-6,
     clip_epsilon: float = 0.2,
