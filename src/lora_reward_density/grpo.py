@@ -31,19 +31,35 @@ def grpo_loss(
     beta = config.kl_beta
     advantage_eps = config.advantage_eps
 
-    prompt_count = int(group_index.max().item()) + 1
-    group_size = group_index.numel() // prompt_count
+    #prompt_count = int(group_index.max().item()) + 1
+    #group_size = group_index.numel() // prompt_count
 
     # do some error checking on sizes
 
-    rewards = reward_output.trajectory_rewards.detach().to(device=device, dtype=dtype)
-    rewards_grouped = rewards.view(prompt_count, group_size)
+    #rewards = reward_output.trajectory_rewards.detach().to(device=device, dtype=dtype)
+    #rewards_grouped = rewards.view(prompt_count, group_size)
 
     # sum and mean per group of G (group_count)
-    mean = rewards_grouped.mean(dim=1, keepdim=True)
-    std = rewards_grouped.std(dim=1, unbiased=True, keepdim=True)
+    #mean = rewards_grouped.mean(dim=1, keepdim=True)
+    #std = rewards_grouped.std(dim=1, unbiased=True, keepdim=True)
 
-    advantages = ((rewards_grouped - mean) / (std + advantage_eps)).reshape(-1)
+    #advantages = ((rewards_grouped - mean) / (std + advantage_eps)).reshape(-1)
+
+    token_rewards = reward_output.token_rewards.detach().to(device=device, dtype=dtype)
+    step_reward_mask = reward_output.step_reward_mask.to(device=device)
+    advantages = torch.zeros_like(token_rewards)
+
+    for prompt_group in group_index.unique():
+        in_this_group = group_index == prompt_group
+        group_deposits = token_rewards[in_this_group][step_reward_mask[in_this_group]]
+        group_mean = group_deposits.mean()
+        group_std = torch.nan_to_num(group_deposits.std())
+        normalized_deposits = torch.where(step_reward_mask[in_this_group], (token_rewards[in_this_group] - group_mean)
+                                          / (group_std + advantage_eps), 0.0
+                                          )
+        advantages[in_this_group] = torch.flip(torch.flip(normalized_deposits, [-1]).cumsum(-1), [-1])
+
+    advantages = advantages * completion_mask
 
     """
     counts = torch.zeros(group_count, device=device).index_add_(0, group_index, torch.ones_like(rewards))
@@ -60,8 +76,8 @@ def grpo_loss(
     importance_ratio = calculate_importance_ratio(learner_logprobs, sampler_logprobs)
     importance_ratio_clipped = importance_ratio.clamp(1.0 - epsilon, 1.0 + epsilon)
 
-    objective = importance_ratio * advantages.unsqueeze(1)
-    clipped_objective = importance_ratio_clipped * advantages.unsqueeze(1)
+    objective = importance_ratio * advantages   #[N, T] * [N, T]
+    clipped_objective = importance_ratio_clipped * advantages
     min_objective = torch.minimum(objective, clipped_objective)
 
     kl = (learner_logprobs.exp() * (learner_logprobs - ref_logprobs)).clamp(min=0)
@@ -78,7 +94,7 @@ def grpo_loss(
 
     diagnostics = {
         "loss": float(loss.detach().item()),
-        "mean_reward": float(rewards.mean().detach().item()),
+        "mean_reward": float(reward_output.trajectory_rewards.mean().detach().item()),
         "mean_advantage": float(advantages.mean().detach().item()),
         "advantage_std": float(advantages.std(unbiased=False).detach().item()),
         "ratio_clip_fraction": float(
