@@ -46,7 +46,9 @@ def grpo_loss(
     #advantages = ((rewards_grouped - mean) / (std + advantage_eps)).reshape(-1)
 
     token_rewards = reward_output.token_rewards.detach().to(device=device, dtype=dtype)
-    step_reward_mask = reward_output.step_reward_mask.to(device=device)
+    step_mask = reward_output.step_reward_mask
+    assert step_mask is not None, "dense GRPO loss requires reward_output.step_reward_mask"
+    step_reward_mask = step_mask.to(device=device)
     advantages = torch.zeros_like(token_rewards)
 
     for prompt_group in group_index.unique():
