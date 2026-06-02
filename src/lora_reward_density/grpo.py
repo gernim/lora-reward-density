@@ -59,7 +59,11 @@ def grpo_loss(
         normalized_deposits = torch.where(step_reward_mask[in_this_group], (token_rewards[in_this_group] - group_mean)
                                           / (group_std + advantage_eps), 0.0
                                           )
-        advantages[in_this_group] = torch.flip(torch.flip(normalized_deposits, [-1]).cumsum(-1), [-1])
+
+        if reward_output.per_token_advantage:
+            advantages[in_this_group] = normalized_deposits
+        else:
+            advantages[in_this_group] = torch.flip(torch.flip(normalized_deposits, [-1]).cumsum(-1), [-1])
 
     advantages = advantages * completion_mask
 
