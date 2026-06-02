@@ -63,6 +63,10 @@ app = modal.App("lora-reward-density-train", image=image)
     gpu="A100-80GB",  # 8B bf16 (~16 GB) + [N,T,V] logits — microbatched; A100 has headroom
     timeout=28800,
     volumes={"/hf-cache": hf_cache},
+    # Per-rollout logprob calls are minutes apart (student generates between
+    # them). Without this the container scales down and RELOADS the 8B every
+    # step (~2 min wasted/step). Keep it warm across the run; scales down after.
+    scaledown_window=900,
 )
 class Teacher:
     @modal.enter()
