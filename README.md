@@ -5,7 +5,7 @@
 
 > **[Read the Full Report (PDF)](paper/final-report.pdf)** | **[View the Poster (PDF)](paper/project-poster.pdf)**
 
-A Stanford CS224R final project that asks whether the LoRA rank needed to match full fine-tuning scales with the *information density* of an RL reward signal. Two recent results bracket the question: [LoRA Without Regret](https://thinkingmachines.ai/blog/lora/) (Thinking Machines Lab, 2025) shows a rank-1 adapter already matches full fine-tuning for sparse *outcome* RL (~`O(1)` bits/episode), while [On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/) reports a large speedup from a dense per-token reward (~`O(N)` bits/episode). Together they imply a scaling law: denser rewards should demand higher rank. We test that law directly by running **one GRPO algorithm across three reward densities** and sweeping LoRA rank against full fine-tuning in each.
+A Stanford CS224R final project that asks whether the LoRA rank needed to match full fine-tuning scales with the *information density* of an RL reward signal. Two recent results bracket the question: [LoRA Without Regret](https://thinkingmachines.ai/blog/lora/) (Thinking Machines Lab, 2025) shows a rank-1 adapter already matches full fine-tuning for sparse *outcome* RL (≈`O(1)` bits/episode), while [On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/) reports a large speedup from a dense per-token reward (≈`O(N)` bits/episode). Together they imply a scaling law: denser rewards should demand higher rank. We test that law directly by running **one GRPO algorithm across three reward densities** and sweeping LoRA rank against full fine-tuning in each.
 
 The answer is a **clean null**: rank-1 LoRA matches full fine-tuning in every regime, and the required rank does *not* rise with reward density. Density's real effect is on **optimization stability**, and it turns on the reward's *structure*, not its raw information content.
 
@@ -38,7 +38,7 @@ _Held-out `eval/pass@1`, mean ± sd over 3 seeds, 100 held-out MATH prompts. Pro
 
 ### 2. Density's real cost is optimization stability, not capacity
 
-Only one regime collapses — and it's not the densest. Process pass@1 climbs to outcome-level accuracy (~0.48) by steps 20–40, then **cliffs to ~0** by steps 60–80 at *every* rank including FullFT. The per-step reward pays for emitting more steps, so completions lengthen until they saturate the 1536-token cap (`frac_truncated → 1.0`) and stop producing a `\boxed{}` answer. The signature is a blown-up advantage scale:
+Only one regime collapses — and it's not the densest. Process pass@1 climbs to outcome-level accuracy (≈0.48) by steps 20–40, then **cliffs to ≈0** by steps 60–80 at *every* rank including FullFT. The per-step reward pays for emitting more steps, so completions lengthen until they saturate the 1536-token cap (`frac_truncated → 1.0`) and stop producing a `\boxed{}` answer. The signature is a blown-up advantage scale:
 
 | Regime | Peak advantage std | Stable? |
 |--------|--------------------|---------|
@@ -46,7 +46,7 @@ Only one regime collapses — and it's not the densest. Process pass@1 climbs to
 | Distillation (`O(N)`) | 1.00 | ✅ |
 | Process (`O(S)`)      | 9.05 | ❌ collapses |
 
-_A ~9× advantage acts like a ~9× learning rate — process trains itself off a cliff._
+_A ≈9× advantage acts like a ≈9× learning rate — process trains itself off a cliff._
 
 ### 3. It's reward *structure*, not raw density
 
@@ -59,14 +59,14 @@ So the blanket claim "dense rewards are hard to optimize" is wrong. The gameable
 
 ### 4. The collapse mechanism: instability *precedes* the hack
 
-Across all 18 process cells the advantage spike is an *early* event, not a symptom of long truncated outputs. `advantage_std` peaks at a mean of **step 28** (range 3–55) while completions are still short and not yet truncating — it precedes length saturation (mean step 70) and the pass@1 collapse (~step 79). The causal chain:
+Across all 18 process cells the advantage spike is an *early* event, not a symptom of long truncated outputs. `advantage_std` peaks at a mean of **step 28** (range 3–55) while completions are still short and not yet truncating — it precedes length saturation (mean step 70) and the pass@1 collapse (≈step 79). The causal chain:
 
 ```
 advantage-magnitude spike  →  length growth  →  truncation  →  no \boxed{} answer  →  pass@1 collapse
         (step ~28)              (step ~70)                                              (step ~79)
 ```
 
-Once the policy has fully hacked, every group is uniform step-spam with near-zero within-group reward variance, so `advantage_std` falls back to ~0 — the cause is already gone by the time the collapse completes.
+Once the policy has fully hacked, every group is uniform step-spam with near-zero within-group reward variance, so `advantage_std` falls back to ≈0 — the cause is already gone by the time the collapse completes.
 
 ## The Bits-per-Episode Hypothesis
 
@@ -74,9 +74,9 @@ The project tests a specific, falsifiable scaling argument assembled from three 
 
 | Ingredient | Source | Claim |
 |------------|--------|-------|
-| Outcome RL is information-sparse | [LoRA Without Regret](https://thinkingmachines.ai/blog/lora/) | outcome RL carries ~`O(1)` bits/episode; rank-1 LoRA matches FullFT |
-| Distillation is information-dense | [On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/) | a per-token signal carries ~`O(N)` bits/episode (`N` = tokens) |
-| Capacity is finite per parameter | [Physics of Language Models](https://arxiv.org/abs/2404.05405) | a trained network stores ~2 bits/parameter; a rank-`r` adapter holds ~`4rd` bits |
+| Outcome RL is information-sparse | [LoRA Without Regret](https://thinkingmachines.ai/blog/lora/) | outcome RL carries ≈`O(1)` bits/episode; rank-1 LoRA matches FullFT |
+| Distillation is information-dense | [On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/) | a per-token signal carries ≈`O(N)` bits/episode (`N` = tokens) |
+| Capacity is finite per parameter | [Physics of Language Models](https://arxiv.org/abs/2404.05405) | a trained network stores ≈2 bits/parameter; a rank-`r` adapter holds ≈`4rd` bits |
 
 Chaining them predicts that the rank needed to match FullFT should grow with reward density. We add **process rewards** (`O(S)`, one signal per reasoning step) as a third, middle-density regime, and measure the rank requirement across all three under one algorithm. **The prediction fails**: the rank requirement is flat in density. We interpret RL as a low-rank nudge to a base model that already possesses the underlying skill — training is not installing new capacity, so the reward's information content does not translate into a demand for trainable parameters.
 
@@ -166,7 +166,7 @@ Always invoke project tools via the venv (`.venv/bin/<tool>`) rather than bare n
 
 ## Usage
 
-### Run the test suite (local, CPU-only, ~5s)
+### Run the test suite (local, CPU-only, ≈5s)
 
 ```bash
 .venv/bin/pytest -q                       # full suite (97 tests)
@@ -232,7 +232,7 @@ Every cell uses an identical configuration, so any difference in outcome is attr
 | Rollout steps            | 100  | LoRA α               | 32 |
 | Optimizer                | AdamW| LoRA placement       | all-linear (attn + MLP) |
 
-**Models.** Student: Qwen3-1.7B-Base. Distillation teacher: Qwen3-8B (separate GPU). **Task:** MATH (`hendrycks_math`), fixed held-out eval split identical across every cell. **Compute:** ~150 H200-hours for the full matrix (+ ~50 A100-hours for the distillation teacher). Every run snapshots its git SHA and pip freeze, and the from-scratch GRPO loss is validated against a TRL reference to Δ=0 on both loss and gradients.
+**Models.** Student: Qwen3-1.7B-Base. Distillation teacher: Qwen3-8B (separate GPU). **Task:** MATH (`hendrycks_math`), fixed held-out eval split identical across every cell. **Compute:** ≈150 H200-hours for the full matrix (+ ≈50 A100-hours for the distillation teacher). Every run snapshots its git SHA and pip freeze, and the from-scratch GRPO loss is validated against a TRL reference to Δ=0 on both loss and gradients.
 
 ## References
 
@@ -244,7 +244,7 @@ Every cell uses an identical configuration, so any difference in outcome is attr
 - **Wang et al.** [Math-Shepherd: Verify and Reinforce LLMs Step-by-step without Human Annotations](https://arxiv.org/abs/2312.08935). ACL, 2024. *(Process reward model.)*
 - **Lightman et al.** [Let's Verify Step by Step](https://arxiv.org/abs/2305.20050). ICLR, 2024. *(Process supervision.)*
 - **Biderman et al.** [LoRA Learns Less and Forgets Less](https://arxiv.org/abs/2405.09673). TMLR, 2024. *(LoRA–FullFT gap on SFT / continued pretraining.)*
-- **Allen-Zhu & Li.** [Physics of Language Models: Part 3.3, Knowledge Capacity Scaling Laws](https://arxiv.org/abs/2404.05405). 2024. *(~2 bits stored per parameter.)*
+- **Allen-Zhu & Li.** [Physics of Language Models: Part 3.3, Knowledge Capacity Scaling Laws](https://arxiv.org/abs/2404.05405). 2024. *(≈2 bits stored per parameter.)*
 - **DeepSeek-AI.** [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](https://arxiv.org/abs/2501.12948). 2025.
 
 ## Author
